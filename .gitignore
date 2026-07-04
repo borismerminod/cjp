@@ -1,0 +1,28 @@
+# Secrets / config locale
+.env
+
+# Environnement virtuel Python
+venv/
+.venv/
+
+# Fichiers Python compilés
+__pycache__/
+*.pyc
+*.pyo
+
+# Modèles (gros fichiers binaires, ne doivent pas être versionnés)
+*.gguf
+*.bin
+*.safetensors
+
+# Historique de conversation (données locales/personnelles)
+sessions/
+
+# Éditeurs / IDE
+.vscode/
+.idea/
+
+# Fichiers système
+Thumbs.db
+desktop.ini
+.DS_Store
