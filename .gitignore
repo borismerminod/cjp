@@ -8,6 +8,10 @@ known_models.json
 venv/
 .venv/
 
+# Sorties de construction PyInstaller (générées via build.spec, plusieurs Go)
+build/
+dist/
+
 # Fichiers Python compilés
 __pycache__/
 *.pyc

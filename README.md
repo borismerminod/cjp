@@ -62,27 +62,74 @@ python main.py
 ```
 
 Une fenêtre s'ouvre avec :
-- une **combo liste de modèles** en haut, avec un bouton "Parcourir..." pour choisir un autre fichier `.gguf` via l'explorateur Windows (le modèle sélectionné est mémorisé pour les prochains lancements, dans `known_models.json`), une case à cocher **"Recherche web"** pour autoriser ou non le modèle à chercher sur internet accompagnée d'une **combo liste de moteurs** (DuckDuckGo par défaut, ou Bing/Brave/Google/Mojeek/Startpage/Yahoo/Yandex), et à droite un **indicateur de stats** (vitesse de génération en tokens/s, RAM utilisée par l'application, VRAM utilisée sur le GPU) ;
+- une **combo liste de modèles** en haut, avec un bouton "Parcourir..." pour choisir un autre fichier `.gguf` via l'explorateur Windows (le modèle sélectionné est mémorisé pour les prochains lancements, dans `known_models.json`) ;
+- une **combo liste de mode** (chat / agent / plan, voir plus bas) et des boutons **"+ Dossier"**/**"+ Fichier"** pour ajouter du contexte ; les dossiers/fichiers ajoutés apparaissent sous forme d'étiquettes juste en dessous, chacune avec une croix "✕" pour la retirer directement ;
+- une case à cocher **"Recherche web"** pour autoriser ou non le modèle à chercher sur internet, accompagnée d'une **combo liste de moteurs** (DuckDuckGo par défaut, ou Bing/Brave/Google/Mojeek/Startpage/Yahoo/Yandex) ;
+- à droite, un **indicateur de stats** (vitesse de génération en tokens/s, RAM utilisée par l'application, VRAM utilisée sur le GPU) ;
 - un **panneau latéral gauche** listant les conversations précédentes (par date de création, ou un nom personnalisé si renommée), avec un bouton "Nouvelle conversation" ; clic droit sur une conversation pour la renommer ou la supprimer ;
 - une **zone principale** affichant les échanges, avec rendu Markdown léger (gras, italique, titres, listes) et coloration syntaxique par langage dans les blocs de code ; la réflexion du modèle (balises `<think>...</think>`) est repliée par défaut sous une ligne `[réflexion ▸]` cliquable pour l'afficher ; clic droit sur un message ou un bloc de code pour le copier ;
-- une **zone de saisie** en bas (Entrée pour envoyer, Maj+Entrée pour un saut de ligne).
+- une **zone de saisie** en bas (Entrée pour envoyer, Maj+Entrée pour un saut de ligne) ; taper `@` y ouvre une liste des fichiers des dossiers de contexte ajoutés, pour en cibler un précisément (son contenu est alors joint au message envoyé).
+
+### Recherche web
 
 Quand la case "Recherche web" est cochée (activée par défaut), le modèle peut chercher sur internet
 quand c'est pertinent (actualités, informations récentes, etc.) via le moteur choisi dans la combo liste
 juste à côté : une ligne "🔍 Recherche : <requête>" s'affiche pendant qu'il interroge le moteur, sans
 qu'aucune action ne soit nécessaire de ta part. Il peut enchaîner jusqu'à 3 recherches pour une même
 question afin d'affiner sa requête si besoin, avant de synthétiser une réponse finale. Décocher la case
-désactive complètement cette capacité pour les messages suivants (le modèle répond alors uniquement à
-partir de ses connaissances). Note : Ecosia n'est pas supporté par la bibliothèque de recherche
-utilisée (`ddgs`), seuls les moteurs listés ci-dessus sont disponibles.
+désactive complètement cette capacité pour les messages suivants. Note : Ecosia n'est pas supporté par
+la bibliothèque de recherche utilisée (`ddgs`), seuls les moteurs listés ci-dessus sont disponibles.
+
+### Modes chat / agent / plan
+
+- **chat** : mode par défaut, le modèle discute (avec recherche web en option), sans toucher aux fichiers.
+- **agent** : le modèle peut lire (`read_file`, `list_directory`) et modifier (`write_file`, `edit_file`)
+  les fichiers des dossiers de contexte ajoutés. **Chaque modification est présentée sous forme de diff
+  coloré dans la conversation, avec des liens "Accepter"/"Rejeter" — rien n'est écrit sur le disque tant
+  que tu n'as pas cliqué "Accepter".**
+- **plan** : le modèle peut lire/explorer les fichiers mais n'a **structurellement** pas accès aux outils
+  d'écriture (ils ne lui sont même pas proposés). Il doit produire un plan structuré, étape par étape.
+  Un lien "Accepter le plan" apparaît à la fin de sa réponse ; cliquer dessus bascule automatiquement en
+  mode agent et relance l'exécution du plan (avec les mêmes confirmations de diff que ci-dessus).
+
+Les dossiers **et fichiers individuels** ajoutés au contexte définissent à la fois la liste des fichiers
+proposés par `@` et le périmètre autorisé pour les outils de fichiers (aucun accès en dehors) — ils sont
+propres à chaque conversation (ajoutés dans une conversation, absents des autres) et sauvegardés avec elle.
+
+Pas d'exécution de commande shell pour l'instant (`run_command`) — prévu pour une étape ultérieure.
 
 Le chargement (ou changement) de modèle prend quelques secondes ; l'interface reste réactive pendant la
 génération d'une réponse, à l'exception de la saisie et de la combo modèle qui sont désactivées jusqu'à
 la fin de la réponse en cours. Le bouton "Envoyer" devient un bouton "Arrêter" pendant la génération,
-pour interrompre une réponse en cours (la réponse partielle est conservée). Seule la réponse finale
-(sans la réflexion) est conservée dans l'historique de conversation.
+pour interrompre une réponse en cours (y compris pendant l'attente d'une confirmation de modification de
+fichier). Seule la réponse finale (sans la réflexion) est conservée dans l'historique de conversation.
 
-L'historique de chaque conversation est sauvegardé automatiquement dans `sessions/`.
+L'historique de chaque conversation (et ses dossiers de contexte) est sauvegardé automatiquement dans
+`sessions/`.
+
+## Créer un exécutable Windows
+
+L'application peut être empaquetée en exécutable autonome (dossier `cjp.exe` + fichiers de support) via
+[PyInstaller](https://pyinstaller.org/), pour la lancer sans installer Python ni activer de venv.
+
+```bash
+venv\Scripts\activate
+pip install -r requirements-build.txt
+python -m PyInstaller build.spec --noconfirm
+copy .env.example dist\cjp\.env.example
+```
+
+Résultat dans `dist/cjp/` (~2 Go, DLL CUDA/GPU incluses — c'est normal, `ggml-cuda.dll` seul fait
+~1 Go). Copier `dist/cjp/.env.example` vers `dist/cjp/.env` et renseigner `MODEL_PATH` avant le premier
+lancement, exactement comme en mode développement (voir "Installation" plus haut) — l'exécutable est
+**portable** : toutes ses données (`.env`, `known_models.json`, `session_titles.json`, `sessions/`) sont
+stockées à côté de `cjp.exe`, pas dans le dossier du projet ni dans `%APPDATA%`. Il suffit de garder tout
+le dossier `dist/cjp/` ensemble pour le déplacer ou le partager.
+
+Le fichier `build.spec` gère explicitement l'inclusion des DLL de `llama-cpp-python` et des runtimes
+CUDA/cuBLAS (non détectées automatiquement par l'analyse statique de PyInstaller, chargées
+dynamiquement via `ctypes`) — ne pas utiliser `pyinstaller main.py` directement, toujours passer par
+`build.spec`.
 
 ## Désinstallation
 
@@ -98,6 +145,7 @@ Puis supprimer :
 - le fichier `.env` (contient ta configuration locale, notamment `MODEL_PATH`)
 - le fichier `known_models.json` (liste des modèles ajoutés via "Parcourir...", propre à ta machine)
 - le fichier `session_titles.json` (noms personnalisés donnés aux conversations)
+- les dossiers `build/` et `dist/` si tu as construit l'exécutable (voir section précédente)
 
 Les fichiers `.gguf` des modèles ne sont pas gérés par ce projet : pour les supprimer, il faut les
 retirer directement depuis l'endroit où ils ont été téléchargés (ex: l'interface de LM Studio) ou

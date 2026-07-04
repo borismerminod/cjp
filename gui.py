@@ -15,19 +15,58 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import psutil
 
-from config import load_config
+from config import get_app_dir, load_config
+from context_folders import list_files_recursive
 from context_manager import ContextManager
 from llm_client import LLMClient
 from markdown_render import render_markdown
 from syntax_highlight import highlight_code
 from think_splitter import ThinkStreamSplitter
 from tool_call_parser import extract_tool_calls
+from tools.file_tools import (
+    EDIT_FILE_TOOL_SCHEMA,
+    LIST_DIRECTORY_TOOL_SCHEMA,
+    READ_FILE_TOOL_SCHEMA,
+    WRITE_FILE_TOOL_SCHEMA,
+    SandboxError,
+    list_directory,
+    preview_edit_file,
+    preview_write_file,
+    read_file,
+)
 from web_search import DEFAULT_SEARCH_ENGINE, SEARCH_ENGINES, WEB_SEARCH_TOOL_SCHEMA, web_search
 
-KNOWN_MODELS_PATH = Path(__file__).parent / "known_models.json"
-SESSION_TITLES_PATH = Path(__file__).parent / "session_titles.json"
+KNOWN_MODELS_PATH = get_app_dir() / "known_models.json"
+SESSION_TITLES_PATH = get_app_dir() / "session_titles.json"
 CODE_BLOCK_RE = re.compile(r"```[ \t]*(\w*)\n(.*?)```", re.DOTALL)
-MAX_TOOL_ITERATIONS = 3
+MENTION_RE = re.compile(r"@([^\s@]*)$")
+MODES = ["chat", "agent", "plan"]
+MAX_TOOL_ITERATIONS_CHAT = 3
+MAX_TOOL_ITERATIONS_AGENTIC = 8
+
+MODE_SYSTEM_PROMPTS = {
+    "chat": None,
+    "agent": (
+        "Tu es en mode AGENT. Tu peux lire et modifier directement les fichiers du projet via "
+        "read_file, list_directory, write_file, edit_file. Chaque write_file/edit_file sera "
+        "présenté à l'utilisateur sous forme de diff qu'il doit valider avant application : le "
+        "fichier n'est pas modifié tant que ce n'est pas accepté."
+    ),
+    "plan": (
+        "Tu es en mode PLAN. Tu peux lire des fichiers et explorer l'arborescence via read_file "
+        "et list_directory, mais tu n'as PAS accès à des outils d'écriture — n'essaie pas d'en "
+        "appeler. Ta réponse finale doit être un plan structuré, étape par étape, que "
+        "l'utilisateur pourra accepter ou rejeter. Ne fournis pas de code complet à appliquer "
+        "directement, décris les changements à faire."
+    ),
+}
+
+TOOL_LABELS = {
+    "web_search": lambda a: f"🔍 Recherche : {a.get('query', '')}",
+    "read_file": lambda a: f"📄 Lecture : {a.get('path', '')}",
+    "list_directory": lambda a: f"📂 Liste : {a.get('path', '') or '.'}",
+}
+
 _PROCESS = psutil.Process()
 
 
@@ -82,6 +121,11 @@ class ChatApp:
         self._gen_token_count = 0
         self._current_tps_text = ""
         self._current_mem_text = ""
+        self._pending_confirmation: dict | None = None
+        self._context_file_index: list[tuple[str, Path]] = []
+        self._pending_context_files: list[Path] = []
+        self._mention_popup: tk.Toplevel | None = None
+        self._mention_matches: list[tuple[str, Path]] = []
 
         self.base_config = load_config()
         self.known_models = load_known_models()
@@ -93,6 +137,7 @@ class ChatApp:
         self._build_widgets()
         self._refresh_model_combobox()
         self._refresh_sidebar()
+        self._refresh_context_file_index()
 
         self.root.after(50, self._poll_queue)
         self._start_resource_polling()
@@ -130,6 +175,21 @@ class ChatApp:
         self.browse_button = ttk.Button(top_bar, text="Parcourir...", command=self._on_browse_clicked)
         self.browse_button.pack(side="left")
 
+        ttk.Separator(top_bar, orient="vertical").pack(side="left", fill="y", padx=8)
+
+        ttk.Label(top_bar, text="Mode :").pack(side="left", padx=(0, 4))
+        self.mode_combobox = ttk.Combobox(top_bar, state="readonly", width=8, values=MODES)
+        self.mode_combobox.set("chat")
+        self.mode_combobox.pack(side="left", padx=(0, 6))
+
+        self.add_folder_button = ttk.Button(top_bar, text="+ Dossier", command=self._on_add_folder_clicked)
+        self.add_folder_button.pack(side="left")
+
+        self.add_file_button = ttk.Button(top_bar, text="+ Fichier", command=self._on_add_file_clicked)
+        self.add_file_button.pack(side="left", padx=(4, 0))
+
+        ttk.Separator(top_bar, orient="vertical").pack(side="left", fill="y", padx=8)
+
         self.web_search_enabled = tk.BooleanVar(value=True)
         self.web_search_checkbox = ttk.Checkbutton(top_bar, text="Recherche web", variable=self.web_search_enabled)
         self.web_search_checkbox.pack(side="left", padx=(10, 4))
@@ -145,6 +205,9 @@ class ChatApp:
 
         self.stats_label = ttk.Label(top_bar, text="", foreground="#555555")
         self.stats_label.pack(side="right", padx=6)
+
+        self.context_items_bar = ttk.Frame(self.root, padding=(6, 0, 6, 6))
+        self.context_items_bar.pack(side="top", fill="x")
 
         body = ttk.PanedWindow(self.root, orient="horizontal")
         body.pack(side="top", fill="both", expand=True)
@@ -194,6 +257,12 @@ class ChatApp:
         self.transcript.tag_configure("md_h3", font=("TkDefaultFont", 11, "bold"), spacing1=4, spacing3=2)
         self.transcript.tag_configure("md_bullet", lmargin1=16, lmargin2=28)
         self.transcript.tag_configure("tool_call_indicator", foreground="#8a5a00", font=("TkDefaultFont", 9, "italic"))
+        self.transcript.tag_configure("diff_add", foreground="#1a7f37", background="#e6ffed", font=("Consolas", 9))
+        self.transcript.tag_configure("diff_remove", foreground="#b31d28", background="#ffeef0", font=("Consolas", 9))
+        self.transcript.tag_configure("diff_context", foreground="#555555", font=("Consolas", 9))
+        self.transcript.tag_configure("confirm_accept", foreground="#1a7f37", underline=True, font=("TkDefaultFont", 10, "bold"))
+        self.transcript.tag_configure("confirm_reject", foreground="#b31d28", underline=True, font=("TkDefaultFont", 10, "bold"))
+        self.transcript.tag_configure("plan_accept", foreground="#1a7f37", underline=True, font=("TkDefaultFont", 10, "bold"))
         # Priorité d'affichage Tkinter = ordre de première configuration des tags (pas
         # l'ordre du tuple passé à insert()). "code" est configuré ci-dessus une fois
         # pour toutes ; chaque tag fg_{couleur} n'est configuré que la première fois
@@ -211,6 +280,10 @@ class ChatApp:
         self.input_text.pack(side="left", fill="both", expand=True)
         self.input_text.bind("<Return>", self._on_input_return)
         self.input_text.bind("<Shift-Return>", lambda e: None)
+        self.input_text.bind("<KeyRelease>", self._on_input_key_release)
+        self.input_text.bind("<Up>", self._on_input_up)
+        self.input_text.bind("<Down>", self._on_input_down)
+        self.input_text.bind("<Escape>", self._on_input_escape)
 
         self.send_button = ttk.Button(input_area, text="Envoyer", command=self.send_message)
         self.send_button.pack(side="right", padx=(6, 0), fill="y")
@@ -307,6 +380,51 @@ class ChatApp:
         self._select_model_in_combobox(path)
         self.start_model_load(path)
 
+    # ------------------------------------------------------------------ dossiers/fichiers de contexte
+
+    def _on_add_folder_clicked(self) -> None:
+        path = filedialog.askdirectory(title="Ajouter un dossier de contexte")
+        if not path:
+            return
+        self.context.add_context_folder(path)
+        self._refresh_context_file_index()
+
+    def _on_add_file_clicked(self) -> None:
+        paths = filedialog.askopenfilenames(title="Ajouter des fichiers de contexte")
+        if not paths:
+            return
+        for path in paths:
+            self.context.add_context_file(path)
+        self._refresh_context_file_index()
+
+    def _refresh_context_file_index(self) -> None:
+        roots = self.context.context_folders_as_paths()
+        self._context_file_index = list_files_recursive(roots)
+        self._refresh_context_items_bar()
+
+    def _refresh_context_items_bar(self) -> None:
+        for widget in self.context_items_bar.winfo_children():
+            widget.destroy()
+
+        for folder in self.context.context_folders:
+            self._add_context_chip(f"📁 {Path(folder).name}", lambda f=folder: self._remove_context_folder(f))
+        for file in self.context.context_files:
+            self._add_context_chip(f"📄 {Path(file).name}", lambda f=file: self._remove_context_file(f))
+
+    def _add_context_chip(self, label: str, on_remove) -> None:
+        chip = ttk.Frame(self.context_items_bar, relief="solid", borderwidth=1)
+        chip.pack(side="left", padx=(0, 4))
+        ttk.Label(chip, text=label, padding=(4, 1)).pack(side="left")
+        ttk.Button(chip, text="✕", width=2, command=on_remove).pack(side="left")
+
+    def _remove_context_folder(self, folder: str) -> None:
+        self.context.remove_context_folder(folder)
+        self._refresh_context_file_index()
+
+    def _remove_context_file(self, file: str) -> None:
+        self.context.remove_context_file(file)
+        self._refresh_context_file_index()
+
     # ------------------------------------------------------------------ conversations (sidebar)
 
     def _refresh_sidebar(self) -> None:
@@ -325,6 +443,7 @@ class ChatApp:
         self.context.reset()
         self._clear_transcript()
         self.sessions_tree.selection_remove(self.sessions_tree.selection())
+        self._refresh_context_file_index()
 
     def _on_session_selected(self, event=None) -> None:
         if self.state != "idle":
@@ -337,6 +456,7 @@ class ChatApp:
             return
         if self.context.resume(session_id):
             self._render_full_transcript()
+            self._refresh_context_file_index()
 
     def _on_session_right_click(self, event) -> None:
         item = self.sessions_tree.identify_row(event.y)
@@ -397,8 +517,9 @@ class ChatApp:
                 block_id = self._reasoning_block_counter
                 tool_calls = extract_tool_calls(message["content"])
                 if tool_calls:
-                    query = tool_calls[0]["arguments"].get("query", "")
-                    indicator = f"🔍 Recherche : {query}"
+                    call = tool_calls[0]
+                    label_fn = TOOL_LABELS.get(call["name"], lambda a: f"🔧 {call['name']}")
+                    indicator = label_fn(call["arguments"])
                     self._message_texts[f"answer_msg_{block_id}"] = indicator
                     self._append_transcript(
                         indicator + "\n", ("assistant", f"answer_msg_{block_id}", "tool_call_indicator")
@@ -481,18 +602,158 @@ class ChatApp:
     # ------------------------------------------------------------------ envoi de message
 
     def _on_input_return(self, event) -> str:
+        if self._mention_popup is not None:
+            self._select_mention()
+            return "break"
         self.send_message()
         return "break"
+
+    def _on_input_up(self, event) -> str | None:
+        if self._mention_popup is None:
+            return None
+        listbox = self._mention_listbox
+        current = listbox.curselection()
+        index = current[0] - 1 if current else listbox.size() - 1
+        if index >= 0:
+            listbox.selection_clear(0, "end")
+            listbox.selection_set(max(index, 0))
+            listbox.activate(max(index, 0))
+        return "break"
+
+    def _on_input_down(self, event) -> str | None:
+        if self._mention_popup is None:
+            return None
+        listbox = self._mention_listbox
+        current = listbox.curselection()
+        index = current[0] + 1 if current else 0
+        if index < listbox.size():
+            listbox.selection_clear(0, "end")
+            listbox.selection_set(index)
+            listbox.activate(index)
+        return "break"
+
+    def _on_input_escape(self, event) -> str | None:
+        if self._mention_popup is None:
+            return None
+        self._close_mention_popup()
+        return "break"
+
+    def _on_input_key_release(self, event) -> None:
+        if event.keysym in ("Up", "Down", "Return", "Escape"):
+            return
+        cursor = self.input_text.index("insert")
+        line_start = f"{cursor.split('.')[0]}.0"
+        text_before = self.input_text.get(line_start, cursor)
+        match = MENTION_RE.search(text_before)
+        if not match:
+            self._close_mention_popup()
+            return
+        self._open_or_update_mention_popup(match.group(1))
+
+    def _open_or_update_mention_popup(self, partial: str) -> None:
+        partial_lower = partial.lower()
+        matches = [entry for entry in self._context_file_index if partial_lower in entry[0].lower()][:20]
+        self._mention_matches = matches
+
+        if self._mention_popup is None:
+            popup = tk.Toplevel(self.root)
+            popup.wm_overrideredirect(True)
+            listbox = tk.Listbox(popup, height=min(8, max(1, len(matches))), width=50)
+            listbox.pack()
+            listbox.bind("<Double-Button-1>", lambda e: self._select_mention())
+            bbox = self.input_text.bbox("insert")
+            x = self.input_text.winfo_rootx() + (bbox[0] if bbox else 0)
+            y = self.input_text.winfo_rooty() + (bbox[1] + bbox[3] if bbox else 0)
+            popup.wm_geometry(f"+{x}+{y}")
+            self._mention_popup = popup
+            self._mention_listbox = listbox
+
+        if not matches:
+            self._close_mention_popup()
+            return
+
+        self._mention_listbox.delete(0, "end")
+        for label, _ in matches:
+            self._mention_listbox.insert("end", label)
+        self._mention_listbox.selection_set(0)
+
+    def _select_mention(self) -> None:
+        if self._mention_popup is None or not self._mention_matches:
+            self._close_mention_popup()
+            return
+        selection = self._mention_listbox.curselection()
+        index = selection[0] if selection else 0
+        label, path = self._mention_matches[index]
+
+        cursor = self.input_text.index("insert")
+        line_start = f"{cursor.split('.')[0]}.0"
+        text_before = self.input_text.get(line_start, cursor)
+        match = MENTION_RE.search(text_before)
+        partial_len = len(match.group(1)) if match else 0
+        self.input_text.delete(f"insert-{partial_len + 1}c", "insert")
+        self.input_text.insert("insert", f"@{label} ")
+
+        if path not in self._pending_context_files:
+            self._pending_context_files.append(path)
+
+        self._close_mention_popup()
+
+    def _close_mention_popup(self) -> None:
+        if self._mention_popup is not None:
+            self._mention_popup.destroy()
+            self._mention_popup = None
+            self._mention_matches = []
+
+    def _tools_for_mode(
+        self, mode: str, web_search_allowed: bool, search_engine: str, allowed_roots: list[Path]
+    ) -> tuple[list[dict], dict]:
+        """Renvoie (schémas_pour_le_modèle, table_de_dispatch) selon le mode courant.
+        write_file/edit_file ne sont volontairement PAS dans la table de dispatch : ils passent
+        par le flux de confirmation bloquante (_run_confirmed_write_tool), jamais un appel direct."""
+        schemas: list[dict] = []
+        table: dict = {}
+        if web_search_allowed:
+            schemas.append(WEB_SEARCH_TOOL_SCHEMA)
+            table["web_search"] = lambda a: web_search(a.get("query", ""), engine=search_engine)
+        if mode in ("agent", "plan") and allowed_roots:
+            schemas += [READ_FILE_TOOL_SCHEMA, LIST_DIRECTORY_TOOL_SCHEMA]
+            table["read_file"] = lambda a: read_file(a.get("path", ""), allowed_roots)
+            table["list_directory"] = lambda a: list_directory(a.get("path", ""), allowed_roots)
+        if mode == "agent" and allowed_roots:
+            schemas += [WRITE_FILE_TOOL_SCHEMA, EDIT_FILE_TOOL_SCHEMA]
+        return schemas, table
+
+    def _build_message_with_mentions(self, text: str) -> str:
+        if not self._pending_context_files:
+            return text
+        blocks = []
+        for path in self._pending_context_files:
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except Exception as e:
+                content = f"[Erreur de lecture : {e}]"
+            label = self._relative_label(path)
+            blocks.append(f"```{label}\n{content}\n```")
+        return "\n\n".join(blocks) + "\n\n" + text
+
+    def _relative_label(self, path: Path) -> str:
+        for label, indexed_path in self._context_file_index:
+            if indexed_path == path:
+                return label
+        return str(path)
 
     def send_message(self) -> None:
         if self.state != "idle":
             return
-        text = self.input_text.get("1.0", "end").strip()
-        if not text:
+        raw_text = self.input_text.get("1.0", "end").strip()
+        if not raw_text:
             return
         self.input_text.delete("1.0", "end")
 
-        self._append_transcript("Vous : " + text + "\n", "user")
+        text = self._build_message_with_mentions(raw_text)
+        self._pending_context_files = []
+
+        self._append_transcript("Vous : " + raw_text + "\n", "user")
         self._append_transcript("Agent : ", "assistant")
 
         self._reasoning_block_counter += 1
@@ -504,11 +765,15 @@ class ChatApp:
 
         self._set_ui_state("generating")
         target_context = self.context
+        mode = self.mode_combobox.get() or "chat"
         web_search_allowed = self.web_search_enabled.get()
         search_engine = self.search_engine_combobox.get() or DEFAULT_SEARCH_ENGINE
+        allowed_roots = target_context.context_folders_as_paths()
+        max_iterations = MAX_TOOL_ITERATIONS_CHAT if mode == "chat" else MAX_TOOL_ITERATIONS_AGENTIC
+        tools_schemas, dispatch_table = self._tools_for_mode(mode, web_search_allowed, search_engine, allowed_roots)
         threading.Thread(
             target=self._send_worker,
-            args=(target_context, text, first_block_id, web_search_allowed, search_engine),
+            args=(target_context, text, first_block_id, mode, tools_schemas, dispatch_table, allowed_roots, max_iterations),
             daemon=True,
         ).start()
 
@@ -516,8 +781,10 @@ class ChatApp:
         if self.state != "generating":
             return
         self._stop_event.set()
+        if self._pending_confirmation is not None:
+            self._resolve_confirmation("reject")
 
-    def _stream_one_turn(self, context: ContextManager, block_id: int, use_tools: bool) -> str:
+    def _stream_one_turn(self, context: ContextManager, block_id: int, mode: str, tools_schemas: list[dict] | None) -> str:
         """Un seul appel au modèle (streaming) ; renvoie le texte de réponse brut (hors
         réflexion). Tourne dans le thread d'arrière-plan."""
         answer_parts: list[str] = []
@@ -530,8 +797,11 @@ class ChatApp:
             self.event_queue.put(("answer_chunk", (context, block_id, t)))
 
         splitter = ThinkStreamSplitter(on_reasoning, on_answer)
-        tools = [WEB_SEARCH_TOOL_SCHEMA] if use_tools else None
-        for chunk in self.client.stream(list(context.history), tools=tools):
+        messages = list(context.history)
+        mode_prompt = MODE_SYSTEM_PROMPTS.get(mode)
+        if mode_prompt:
+            messages = [{"role": "system", "content": mode_prompt}] + messages
+        for chunk in self.client.stream(messages, tools=tools_schemas):
             if self._stop_event.is_set():
                 break
             content = chunk["choices"][0]["delta"].get("content")
@@ -540,40 +810,77 @@ class ChatApp:
         splitter.flush()
         return "".join(answer_parts)
 
+    def _run_confirmed_write_tool(
+        self, context: ContextManager, block_id: int, name: str, args: dict, allowed_roots: list[Path]
+    ) -> str:
+        try:
+            if name == "write_file":
+                diff_text, apply_fn = preview_write_file(args.get("path", ""), args.get("content", ""), allowed_roots)
+            else:
+                diff_text, apply_fn = preview_edit_file(
+                    args.get("path", ""), args.get("old_text", ""), args.get("new_text", ""), allowed_roots
+                )
+        except SandboxError as e:
+            return f"Erreur : {e}"
+
+        event = threading.Event()
+        holder = {"decision": None}
+        self._pending_confirmation = {"event": event, "holder": holder, "context": context, "block_id": block_id}
+        self.event_queue.put(("tool_confirmation_needed", (context, block_id, name, args, diff_text)))
+        event.wait()
+        self._pending_confirmation = None
+
+        if holder["decision"] == "accept":
+            try:
+                apply_fn()
+                return f"Modification appliquée à {args.get('path', '')}."
+            except Exception as e:
+                return f"Erreur lors de l'application : {e}"
+        return "L'utilisateur a refusé cette modification."
+
     def _send_worker(
         self,
         context: ContextManager,
         text: str,
         first_block_id: int,
-        web_search_allowed: bool,
-        search_engine: str,
+        mode: str,
+        tools_schemas: list[dict],
+        dispatch_table: dict,
+        allowed_roots: list[Path],
+        max_iterations: int,
     ) -> None:
         context.add_message("user", text)
         self.event_queue.put(("sidebar_refresh", None))
 
         block_id = first_block_id
         try:
-            for iteration in range(MAX_TOOL_ITERATIONS + 1):
+            for iteration in range(max_iterations + 1):
                 if self._stop_event.is_set():
                     break
                 # Dernière itération autorisée : pas d'outil, pour forcer une vraie réponse.
-                use_tools = web_search_allowed and iteration < MAX_TOOL_ITERATIONS
-                raw_answer = self._stream_one_turn(context, block_id, use_tools)
+                use_tools = iteration < max_iterations
+                raw_answer = self._stream_one_turn(context, block_id, mode, tools_schemas if use_tools else None)
                 if self._stop_event.is_set():
                     break
 
                 tool_calls = extract_tool_calls(raw_answer) if use_tools else []
                 if not tool_calls:
-                    self.event_queue.put(("turn_final", (context, block_id, raw_answer)))
+                    self.event_queue.put(("turn_final", (context, block_id, mode, raw_answer)))
                     self.event_queue.put(("exchange_done", (context, raw_answer)))
                     return
 
-                call = tool_calls[0]  # une seule recherche à la fois, même si plusieurs sont demandées
-                query = call["arguments"].get("query", "")
-                self.event_queue.put(("turn_tool_call", (context, block_id, query)))
-                if self._stop_event.is_set():
-                    break
-                result_text = web_search(query, engine=search_engine)
+                call = tool_calls[0]  # un seul appel d'outil traité par itération
+                name, args = call["name"], call["arguments"]
+
+                if name in ("write_file", "edit_file") and mode == "agent":
+                    result_text = self._run_confirmed_write_tool(context, block_id, name, args, allowed_roots)
+                elif name in dispatch_table:
+                    self.event_queue.put(("turn_tool_call", (context, block_id, name, args)))
+                    if self._stop_event.is_set():
+                        break
+                    result_text = dispatch_table[name](args)
+                else:
+                    result_text = f"Outil inconnu ou non autorisé dans ce mode : {name}"
 
                 context.add_message("assistant", raw_answer)
                 context.add_message("tool", result_text)
@@ -639,28 +946,40 @@ class ChatApp:
                 self.transcript.configure(state="disabled")
                 break
 
-    def _on_turn_tool_call(self, context: ContextManager, block_id: int, query: str) -> None:
-        """Une itération s'est terminée par une demande de recherche : efface le texte brut
-        affiché (qui contiendrait la balise <tool_call>) et le remplace par un indicateur."""
+    def _on_turn_tool_call(self, context: ContextManager, block_id: int, name: str, args: dict) -> None:
+        """Une itération s'est terminée par une demande d'outil (recherche, lecture...) : efface
+        le texte brut affiché (qui contiendrait la balise <tool_call>) et le remplace par un
+        indicateur adapté à l'outil demandé."""
         self._reasoning_toggle_inserted = None
-        indicator = f"🔍 Recherche : {query}"
+        label_fn = TOOL_LABELS.get(name, lambda a: f"🔧 {name}")
+        indicator = label_fn(args)
         self._message_texts[f"answer_msg_{block_id}"] = indicator
         if context is not self.context:
             return
-        self._clear_answer_range(block_id)
+        self._clear_tag_range(f"answer_msg_{block_id}")
         self._append_transcript(indicator + "\n", ("assistant", f"answer_msg_{block_id}", "tool_call_indicator"))
 
-    def _on_turn_final(self, context: ContextManager, block_id: int, raw_answer: str) -> None:
+    def _on_turn_final(self, context: ContextManager, block_id: int, mode: str, raw_answer: str) -> None:
         """Une itération s'est terminée par une vraie réponse finale (pas d'appel d'outil) :
-        reprend le texte brut affiché pour y appliquer Markdown/coloration de code."""
+        reprend le texte brut affiché pour y appliquer Markdown/coloration de code. En mode
+        "plan", ajoute un lien "Accepter" pour basculer en mode agent et exécuter le plan."""
         self._reasoning_toggle_inserted = None
         if context is not self.context:
             return
-        self._clear_answer_range(block_id)
+        self._clear_tag_range(f"answer_msg_{block_id}")
         self._render_message_content(raw_answer, block_id)
+        if mode == "plan":
+            self._append_transcript("\n", "assistant")
+            self._append_transcript(
+                "[ Accepter le plan ]", ("assistant", "plan_accept", f"plan_accept_{block_id}")
+            )
+            self.transcript.tag_bind(
+                f"plan_accept_{block_id}",
+                "<Button-1>",
+                lambda e, c=context, t=raw_answer: self._on_plan_accepted(c, t),
+            )
 
-    def _clear_answer_range(self, block_id: int) -> None:
-        tag = f"answer_msg_{block_id}"
+    def _clear_tag_range(self, tag: str) -> None:
         ranges = self.transcript.tag_ranges(tag)
         if not ranges:
             return
@@ -668,6 +987,59 @@ class ChatApp:
         self.transcript.configure(state="normal")
         self.transcript.delete(start, end)
         self.transcript.configure(state="disabled")
+
+    def _on_plan_accepted(self, context: ContextManager, plan_text: str) -> None:
+        if self.state != "idle" or context is not self.context:
+            return
+        self.mode_combobox.set("agent")
+        self.input_text.delete("1.0", "end")
+        self.input_text.insert("1.0", f"Mets en œuvre le plan suivant :\n\n{plan_text}")
+        self.send_message()
+
+    def _on_tool_confirmation_needed(
+        self, context: ContextManager, block_id: int, name: str, args: dict, diff_text: str
+    ) -> None:
+        self._reasoning_toggle_inserted = None
+        path_label = args.get("path", "")
+        self._message_texts[f"answer_msg_{block_id}"] = f"Modification proposée : {path_label}"
+        if context is not self.context:
+            return
+        self._clear_tag_range(f"answer_msg_{block_id}")
+        self._append_transcript(f"✏️ Modification proposée : {path_label}\n", ("assistant", f"answer_msg_{block_id}"))
+        self._render_diff(diff_text, block_id)
+        self._append_transcript("[ Accepter ]  ", ("assistant", "confirm_accept", f"confirm_accept_{block_id}"))
+        self._append_transcript("[ Rejeter ]\n", ("assistant", "confirm_reject", f"confirm_reject_{block_id}"))
+        self.transcript.tag_bind(f"confirm_accept_{block_id}", "<Button-1>", lambda e: self._resolve_confirmation("accept"))
+        self.transcript.tag_bind(f"confirm_reject_{block_id}", "<Button-1>", lambda e: self._resolve_confirmation("reject"))
+
+    def _render_diff(self, diff_text: str, block_id: int, max_lines: int = 200) -> None:
+        lines = diff_text.splitlines()
+        truncated = lines[:max_lines]
+        base_tags = ("assistant", f"answer_msg_{block_id}")
+        for line in truncated:
+            if line.startswith("+") and not line.startswith("+++"):
+                tag = "diff_add"
+            elif line.startswith("-") and not line.startswith("---"):
+                tag = "diff_remove"
+            else:
+                tag = "diff_context"
+            self._append_transcript(line + "\n", base_tags + (tag,))
+        if len(lines) > max_lines:
+            self._append_transcript(f"... ({len(lines) - max_lines} lignes supplémentaires)\n", base_tags + ("diff_context",))
+
+    def _resolve_confirmation(self, decision: str) -> None:
+        pending = self._pending_confirmation
+        if pending is None:
+            return
+        pending["holder"]["decision"] = decision
+        pending["event"].set()
+
+        block_id = pending["block_id"]
+        summary = "Modification appliquée." if decision == "accept" else "Modification refusée."
+        self._message_texts[f"answer_msg_{block_id}"] = summary
+        if pending["context"] is self.context:
+            self._clear_tag_range(f"answer_msg_{block_id}")
+            self._append_transcript(summary + "\n", ("assistant", f"answer_msg_{block_id}"))
 
     def _on_exchange_done(self, context: ContextManager, full_answer: str) -> None:
         threading.Thread(target=self._finalize_answer_worker, args=(context, full_answer), daemon=True).start()
@@ -747,11 +1119,14 @@ class ChatApp:
                     context, block_id, text = payload
                     self._on_reasoning_chunk(context, block_id, text)
                 elif tag == "turn_tool_call":
-                    context, block_id, query = payload
-                    self._on_turn_tool_call(context, block_id, query)
+                    context, block_id, name, args = payload
+                    self._on_turn_tool_call(context, block_id, name, args)
                 elif tag == "turn_final":
-                    context, block_id, raw_answer = payload
-                    self._on_turn_final(context, block_id, raw_answer)
+                    context, block_id, mode, raw_answer = payload
+                    self._on_turn_final(context, block_id, mode, raw_answer)
+                elif tag == "tool_confirmation_needed":
+                    context, block_id, name, args, diff_text = payload
+                    self._on_tool_confirmation_needed(context, block_id, name, args, diff_text)
                 elif tag == "exchange_done":
                     context, full_answer = payload
                     self._on_exchange_done(context, full_answer)

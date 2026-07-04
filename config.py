@@ -1,6 +1,7 @@
 """Chargement de la configuration de l'application depuis le fichier .env."""
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,6 +11,16 @@ DEFAULT_N_CTX = 4096
 DEFAULT_N_GPU_LAYERS = -1
 DEFAULT_MAX_CONTEXT_CHARS = 8000
 DEFAULT_MAX_TOKENS = 2048
+
+
+def get_app_dir() -> Path:
+    """Dossier de référence pour les données de l'application (.env, known_models.json,
+    sessions/, ...). Pointe à côté de l'exécutable une fois empaqueté (PyInstaller), ou à
+    côté des sources en développement — jamais le répertoire de travail courant, qui peut
+    différer selon comment l'app est lancée."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
 
 
 @dataclass
@@ -24,9 +35,9 @@ class Config:
 
 
 def load_config() -> Config:
-    load_dotenv()
+    project_root = get_app_dir()
+    load_dotenv(project_root / ".env")
 
-    project_root = Path.cwd()
     sessions_dir = project_root / "sessions"
     sessions_dir.mkdir(exist_ok=True)
 
