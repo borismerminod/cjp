@@ -5,3 +5,4 @@ nvidia-cublas-cu12
 python-dotenv
 pygments
 psutil
+ddgs

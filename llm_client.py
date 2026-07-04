@@ -57,8 +57,12 @@ class LLMClient:
         on l'absorbe ici plutôt que lors du premier message de l'utilisateur."""
         list(self.llm.create_chat_completion(messages=[{"role": "user", "content": "Salut"}], max_tokens=1, stream=True))
 
-    def stream(self, messages: list[dict]) -> Iterable[dict]:
-        return self.llm.create_chat_completion(messages=messages, stream=True, max_tokens=self.max_tokens)
+    def stream(self, messages: list[dict], tools: list[dict] | None = None) -> Iterable[dict]:
+        kwargs = {"messages": messages, "stream": True, "max_tokens": self.max_tokens}
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        return self.llm.create_chat_completion(**kwargs)
 
     def complete(self, messages: list[dict]) -> str:
         response = self.llm.create_chat_completion(messages=messages, stream=False, max_tokens=self.max_tokens)
