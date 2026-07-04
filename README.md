@@ -18,6 +18,7 @@ globalement sur la machine, à l'exception d'un pilote NVIDIA à jour (déjà pr
 | `python-dotenv` | Lecture du fichier `.env` |
 | `pygments` | Coloration syntaxique des blocs de code dans les réponses |
 | `psutil` | Mesure de la RAM utilisée par l'application (affichage des stats) |
+| `ddgs` | Recherche web (DuckDuckGo, Bing, Brave, Google, Mojeek, Startpage, Yahoo, Yandex — sans clé API) utilisable par le modèle |
 
 **Modèle** : le fichier `.gguf` du modèle n'est pas installé par ce projet — il est référencé via un
 chemin choisi dans l'interface (ou `MODEL_PATH` dans `.env` au premier lancement). Le modèle par défaut
@@ -61,10 +62,19 @@ python main.py
 ```
 
 Une fenêtre s'ouvre avec :
-- une **combo liste de modèles** en haut, avec un bouton "Parcourir..." pour choisir un autre fichier `.gguf` via l'explorateur Windows (le modèle sélectionné est mémorisé pour les prochains lancements, dans `known_models.json`), et à droite un **indicateur de stats** (vitesse de génération en tokens/s, RAM utilisée par l'application, VRAM utilisée sur le GPU) ;
+- une **combo liste de modèles** en haut, avec un bouton "Parcourir..." pour choisir un autre fichier `.gguf` via l'explorateur Windows (le modèle sélectionné est mémorisé pour les prochains lancements, dans `known_models.json`), une case à cocher **"Recherche web"** pour autoriser ou non le modèle à chercher sur internet accompagnée d'une **combo liste de moteurs** (DuckDuckGo par défaut, ou Bing/Brave/Google/Mojeek/Startpage/Yahoo/Yandex), et à droite un **indicateur de stats** (vitesse de génération en tokens/s, RAM utilisée par l'application, VRAM utilisée sur le GPU) ;
 - un **panneau latéral gauche** listant les conversations précédentes (par date de création, ou un nom personnalisé si renommée), avec un bouton "Nouvelle conversation" ; clic droit sur une conversation pour la renommer ou la supprimer ;
 - une **zone principale** affichant les échanges, avec rendu Markdown léger (gras, italique, titres, listes) et coloration syntaxique par langage dans les blocs de code ; la réflexion du modèle (balises `<think>...</think>`) est repliée par défaut sous une ligne `[réflexion ▸]` cliquable pour l'afficher ; clic droit sur un message ou un bloc de code pour le copier ;
 - une **zone de saisie** en bas (Entrée pour envoyer, Maj+Entrée pour un saut de ligne).
+
+Quand la case "Recherche web" est cochée (activée par défaut), le modèle peut chercher sur internet
+quand c'est pertinent (actualités, informations récentes, etc.) via le moteur choisi dans la combo liste
+juste à côté : une ligne "🔍 Recherche : <requête>" s'affiche pendant qu'il interroge le moteur, sans
+qu'aucune action ne soit nécessaire de ta part. Il peut enchaîner jusqu'à 3 recherches pour une même
+question afin d'affiner sa requête si besoin, avant de synthétiser une réponse finale. Décocher la case
+désactive complètement cette capacité pour les messages suivants (le modèle répond alors uniquement à
+partir de ses connaissances). Note : Ecosia n'est pas supporté par la bibliothèque de recherche
+utilisée (`ddgs`), seuls les moteurs listés ci-dessus sont disponibles.
 
 Le chargement (ou changement) de modèle prend quelques secondes ; l'interface reste réactive pendant la
 génération d'une réponse, à l'exception de la saisie et de la combo modèle qui sont désactivées jusqu'à

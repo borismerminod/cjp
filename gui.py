@@ -21,10 +21,13 @@ from llm_client import LLMClient
 from markdown_render import render_markdown
 from syntax_highlight import highlight_code
 from think_splitter import ThinkStreamSplitter
+from tool_call_parser import extract_tool_calls
+from web_search import DEFAULT_SEARCH_ENGINE, SEARCH_ENGINES, WEB_SEARCH_TOOL_SCHEMA, web_search
 
 KNOWN_MODELS_PATH = Path(__file__).parent / "known_models.json"
 SESSION_TITLES_PATH = Path(__file__).parent / "session_titles.json"
 CODE_BLOCK_RE = re.compile(r"```[ \t]*(\w*)\n(.*?)```", re.DOTALL)
+MAX_TOOL_ITERATIONS = 3
 _PROCESS = psutil.Process()
 
 
@@ -73,7 +76,6 @@ class ChatApp:
         self.state = "loading"  # "loading" | "generating" | "idle"
         self.client: LLMClient | None = None
         self.current_model_path: str | None = None
-        self._pending_answer = ""
         self._reasoning_toggle_inserted = None
         self._stop_event = threading.Event()
         self._gen_start_time = 0.0
@@ -128,6 +130,16 @@ class ChatApp:
         self.browse_button = ttk.Button(top_bar, text="Parcourir...", command=self._on_browse_clicked)
         self.browse_button.pack(side="left")
 
+        self.web_search_enabled = tk.BooleanVar(value=True)
+        self.web_search_checkbox = ttk.Checkbutton(top_bar, text="Recherche web", variable=self.web_search_enabled)
+        self.web_search_checkbox.pack(side="left", padx=(10, 4))
+
+        self.search_engine_combobox = ttk.Combobox(
+            top_bar, state="readonly", width=11, values=SEARCH_ENGINES
+        )
+        self.search_engine_combobox.set(DEFAULT_SEARCH_ENGINE)
+        self.search_engine_combobox.pack(side="left")
+
         self.loading_label = ttk.Label(top_bar, text="", foreground="#b8860b")
         self.loading_label.pack(side="left", padx=10)
 
@@ -181,6 +193,7 @@ class ChatApp:
         self.transcript.tag_configure("md_h2", font=("TkDefaultFont", 13, "bold"), spacing1=5, spacing3=2)
         self.transcript.tag_configure("md_h3", font=("TkDefaultFont", 11, "bold"), spacing1=4, spacing3=2)
         self.transcript.tag_configure("md_bullet", lmargin1=16, lmargin2=28)
+        self.transcript.tag_configure("tool_call_indicator", foreground="#8a5a00", font=("TkDefaultFont", 9, "italic"))
         # Priorité d'affichage Tkinter = ordre de première configuration des tags (pas
         # l'ordre du tuple passé à insert()). "code" est configuré ci-dessus une fois
         # pour toutes ; chaque tag fg_{couleur} n'est configuré que la première fois
@@ -204,7 +217,6 @@ class ChatApp:
 
         self._reasoning_block_counter = 0
         self._code_block_counter = 0
-        self._current_block_id: int | None = None
         self._message_texts: dict[str, str] = {}
         self._fg_tags: set[str] = set()
 
@@ -371,16 +383,31 @@ class ChatApp:
 
     def _render_full_transcript(self) -> None:
         self._clear_transcript()
+        agent_prefix_needed = False
         for message in self.context.history:
-            if message["role"] == "user":
+            role = message["role"]
+            if role == "user":
                 self._append_transcript("Vous : " + message["content"] + "\n", "user")
-            elif message["role"] == "assistant":
+                agent_prefix_needed = True
+            elif role == "assistant":
+                if agent_prefix_needed:
+                    self._append_transcript("Agent : ", "assistant")
+                    agent_prefix_needed = False
                 self._reasoning_block_counter += 1
                 block_id = self._reasoning_block_counter
-                self._message_texts[f"answer_msg_{block_id}"] = message["content"]
-                self._append_transcript("Agent : ", "assistant")
-                self._render_message_content(message["content"], block_id)
-                self._append_transcript("\n", "assistant")
+                tool_calls = extract_tool_calls(message["content"])
+                if tool_calls:
+                    query = tool_calls[0]["arguments"].get("query", "")
+                    indicator = f"🔍 Recherche : {query}"
+                    self._message_texts[f"answer_msg_{block_id}"] = indicator
+                    self._append_transcript(
+                        indicator + "\n", ("assistant", f"answer_msg_{block_id}", "tool_call_indicator")
+                    )
+                else:
+                    self._message_texts[f"answer_msg_{block_id}"] = message["content"]
+                    self._render_message_content(message["content"], block_id)
+                    self._append_transcript("\n", "assistant")
+            # role == "tool" : résultats bruts non ré-affichés (déjà résumés par la ligne de recherche)
 
     def _render_message_content(self, text: str, block_id: int) -> None:
         """Insère le texte d'une réponse déjà complète : rendu Markdown léger pour la
@@ -420,19 +447,6 @@ class ChatApp:
                 self._append_transcript(segment, base_tags + extra_tags)
 
         render_markdown(text, emit)
-
-    def _reformat_message_with_code_blocks(self, block_id: int, full_text: str) -> None:
-        """Reprend en fin de streaming le rendu brut d'une réponse pour y détecter et
-        styler les blocs de code (non fait pendant le streaming, trop coûteux token par token)."""
-        tag = f"answer_msg_{block_id}"
-        ranges = self.transcript.tag_ranges(tag)
-        if not ranges:
-            return
-        start, end = str(ranges[0]), str(ranges[-1])
-        self.transcript.configure(state="normal")
-        self.transcript.delete(start, end)
-        self.transcript.configure(state="disabled")
-        self._render_message_content(full_text, block_id)
 
     def _append_transcript(self, text: str, tags) -> None:
         self.transcript.configure(state="normal")
@@ -482,9 +496,7 @@ class ChatApp:
         self._append_transcript("Agent : ", "assistant")
 
         self._reasoning_block_counter += 1
-        block_id = self._reasoning_block_counter
-        self._current_block_id = block_id
-        self._message_texts[f"answer_msg_{block_id}"] = ""
+        first_block_id = self._reasoning_block_counter
 
         self._stop_event.clear()
         self._gen_start_time = time.monotonic()
@@ -492,41 +504,92 @@ class ChatApp:
 
         self._set_ui_state("generating")
         target_context = self.context
-        threading.Thread(target=self._send_worker, args=(target_context, text, block_id), daemon=True).start()
+        web_search_allowed = self.web_search_enabled.get()
+        search_engine = self.search_engine_combobox.get() or DEFAULT_SEARCH_ENGINE
+        threading.Thread(
+            target=self._send_worker,
+            args=(target_context, text, first_block_id, web_search_allowed, search_engine),
+            daemon=True,
+        ).start()
 
     def stop_generation(self) -> None:
         if self.state != "generating":
             return
         self._stop_event.set()
 
-    def _send_worker(self, context: ContextManager, text: str, block_id: int) -> None:
-        context.add_message("user", text)
-        self.event_queue.put(("sidebar_refresh", None))
+    def _stream_one_turn(self, context: ContextManager, block_id: int, use_tools: bool) -> str:
+        """Un seul appel au modèle (streaming) ; renvoie le texte de réponse brut (hors
+        réflexion). Tourne dans le thread d'arrière-plan."""
+        answer_parts: list[str] = []
 
         def on_reasoning(t: str) -> None:
             self.event_queue.put(("reasoning_chunk", (context, block_id, t)))
 
         def on_answer(t: str) -> None:
+            answer_parts.append(t)
             self.event_queue.put(("answer_chunk", (context, block_id, t)))
 
         splitter = ThinkStreamSplitter(on_reasoning, on_answer)
+        tools = [WEB_SEARCH_TOOL_SCHEMA] if use_tools else None
+        for chunk in self.client.stream(list(context.history), tools=tools):
+            if self._stop_event.is_set():
+                break
+            content = chunk["choices"][0]["delta"].get("content")
+            if content:
+                splitter.feed(content)
+        splitter.flush()
+        return "".join(answer_parts)
+
+    def _send_worker(
+        self,
+        context: ContextManager,
+        text: str,
+        first_block_id: int,
+        web_search_allowed: bool,
+        search_engine: str,
+    ) -> None:
+        context.add_message("user", text)
+        self.event_queue.put(("sidebar_refresh", None))
+
+        block_id = first_block_id
         try:
-            for chunk in self.client.stream(list(context.history)):
+            for iteration in range(MAX_TOOL_ITERATIONS + 1):
                 if self._stop_event.is_set():
                     break
-                content = chunk["choices"][0]["delta"].get("content")
-                if content:
-                    splitter.feed(content)
-            splitter.flush()
+                # Dernière itération autorisée : pas d'outil, pour forcer une vraie réponse.
+                use_tools = web_search_allowed and iteration < MAX_TOOL_ITERATIONS
+                raw_answer = self._stream_one_turn(context, block_id, use_tools)
+                if self._stop_event.is_set():
+                    break
+
+                tool_calls = extract_tool_calls(raw_answer) if use_tools else []
+                if not tool_calls:
+                    self.event_queue.put(("turn_final", (context, block_id, raw_answer)))
+                    self.event_queue.put(("exchange_done", (context, raw_answer)))
+                    return
+
+                call = tool_calls[0]  # une seule recherche à la fois, même si plusieurs sont demandées
+                query = call["arguments"].get("query", "")
+                self.event_queue.put(("turn_tool_call", (context, block_id, query)))
+                if self._stop_event.is_set():
+                    break
+                result_text = web_search(query, engine=search_engine)
+
+                context.add_message("assistant", raw_answer)
+                context.add_message("tool", result_text)
+                self.event_queue.put(("sidebar_refresh", None))
+
+                self._reasoning_block_counter += 1
+                block_id = self._reasoning_block_counter
         except Exception as e:
             self.event_queue.put(("stream_error", (context, e)))
             return
 
-        self.event_queue.put(("stream_done", context))
+        self.event_queue.put(("exchange_done", (context, "")))
 
     def _on_answer_chunk(self, context: ContextManager, block_id: int, text: str) -> None:
-        self._pending_answer += text
-        self._message_texts[f"answer_msg_{block_id}"] += text
+        key = f"answer_msg_{block_id}"
+        self._message_texts[key] = self._message_texts.get(key, "") + text
         self._count_generated_token()
         if context is not self.context:
             return
@@ -576,18 +639,44 @@ class ChatApp:
                 self.transcript.configure(state="disabled")
                 break
 
-    def _on_stream_done(self, context: ContextManager) -> None:
-        full_answer = self._pending_answer
-        self._pending_answer = ""
+    def _on_turn_tool_call(self, context: ContextManager, block_id: int, query: str) -> None:
+        """Une itération s'est terminée par une demande de recherche : efface le texte brut
+        affiché (qui contiendrait la balise <tool_call>) et le remplace par un indicateur."""
         self._reasoning_toggle_inserted = None
-        if context is self.context and self._current_block_id is not None:
-            self._reformat_message_with_code_blocks(self._current_block_id, full_answer)
+        indicator = f"🔍 Recherche : {query}"
+        self._message_texts[f"answer_msg_{block_id}"] = indicator
+        if context is not self.context:
+            return
+        self._clear_answer_range(block_id)
+        self._append_transcript(indicator + "\n", ("assistant", f"answer_msg_{block_id}", "tool_call_indicator"))
+
+    def _on_turn_final(self, context: ContextManager, block_id: int, raw_answer: str) -> None:
+        """Une itération s'est terminée par une vraie réponse finale (pas d'appel d'outil) :
+        reprend le texte brut affiché pour y appliquer Markdown/coloration de code."""
+        self._reasoning_toggle_inserted = None
+        if context is not self.context:
+            return
+        self._clear_answer_range(block_id)
+        self._render_message_content(raw_answer, block_id)
+
+    def _clear_answer_range(self, block_id: int) -> None:
+        tag = f"answer_msg_{block_id}"
+        ranges = self.transcript.tag_ranges(tag)
+        if not ranges:
+            return
+        start, end = str(ranges[0]), str(ranges[-1])
+        self.transcript.configure(state="normal")
+        self.transcript.delete(start, end)
+        self.transcript.configure(state="disabled")
+
+    def _on_exchange_done(self, context: ContextManager, full_answer: str) -> None:
         threading.Thread(target=self._finalize_answer_worker, args=(context, full_answer), daemon=True).start()
 
     def _finalize_answer_worker(self, context: ContextManager, full_answer: str) -> None:
         # Une génération arrêtée avant l'apparition de la réponse finale (encore en pleine
-        # réflexion) ne produit aucun texte de réponse : ne pas polluer l'historique avec
-        # un message assistant vide dans ce cas.
+        # réflexion, ou en pleine recherche) ne produit aucun texte de réponse : ne pas polluer
+        # l'historique avec un message assistant vide dans ce cas. Les tours intermédiaires
+        # (recherche) ont déjà été sauvegardés directement par _send_worker.
         if full_answer.strip():
             context.add_message("assistant", full_answer)
         self.event_queue.put(("assistant_saved", context))
@@ -601,7 +690,6 @@ class ChatApp:
             self._set_ui_state("idle")
 
     def _on_stream_error(self, context: ContextManager, error: Exception) -> None:
-        self._pending_answer = ""
         self._reasoning_toggle_inserted = None
         if context is self.context:
             self._append_transcript(f"\n[Erreur : {error}]\n", "assistant")
@@ -658,8 +746,15 @@ class ChatApp:
                 elif tag == "reasoning_chunk":
                     context, block_id, text = payload
                     self._on_reasoning_chunk(context, block_id, text)
-                elif tag == "stream_done":
-                    self._on_stream_done(payload)
+                elif tag == "turn_tool_call":
+                    context, block_id, query = payload
+                    self._on_turn_tool_call(context, block_id, query)
+                elif tag == "turn_final":
+                    context, block_id, raw_answer = payload
+                    self._on_turn_final(context, block_id, raw_answer)
+                elif tag == "exchange_done":
+                    context, full_answer = payload
+                    self._on_exchange_done(context, full_answer)
                 elif tag == "stream_error":
                     context, error = payload
                     self._on_stream_error(context, error)
