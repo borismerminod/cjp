@@ -59,3 +59,12 @@ class ContextManager:
 
     def list_sessions(self) -> list[str]:
         return sorted(p.stem for p in self.sessions_dir.glob("*.json"))
+
+    def delete_session(self, session_id: str) -> bool:
+        path = self.sessions_dir / f"{session_id}.json"
+        if not path.exists():
+            return False
+        path.unlink()
+        if session_id == self.session_id:
+            self.reset()
+        return True

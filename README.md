@@ -1,11 +1,12 @@
 # cjp
 
-Agent de code en Python (CLI), sur le modèle d'Aider / Claude Code.
+Agent de code en Python avec interface graphique (Tkinter), sur le modèle d'Aider / Claude Code.
 
 ## Ce qui est installé pour ce projet
 
 Tout est confiné à un environnement virtuel Python (`venv/`) local au projet — rien n'est installé
-globalement sur la machine, à l'exception d'un pilote NVIDIA à jour (déjà présent) et de Python lui-même.
+globalement sur la machine, à l'exception d'un pilote NVIDIA à jour (déjà présent) et de Python lui-même
+(Tkinter fait partie de la bibliothèque standard Python, aucune installation séparée n'est nécessaire).
 
 **Dépendances Python** (listées dans [requirements.txt](requirements.txt), installées dans `venv/`) :
 
@@ -14,16 +15,16 @@ globalement sur la machine, à l'exception d'un pilote NVIDIA à jour (déjà pr
 | `llama-cpp-python` | Fait tourner le modèle GGUF directement dans le process Python (build accéléré GPU/CUDA, récupéré depuis le dépôt de wheels précompilées du projet plutôt que PyPI) |
 | `nvidia-cuda-runtime-cu12` | Runtime CUDA (DLL) nécessaire à `llama-cpp-python` pour utiliser le GPU |
 | `nvidia-cublas-cu12` | Bibliothèque cuBLAS (calcul matriciel GPU) nécessaire à `llama-cpp-python` |
-| `rich` | Rendu terminal (couleurs, markdown, spinner de chargement) |
-| `prompt_toolkit` | Saisie utilisateur avancée (historique, autocomplétion) |
 | `python-dotenv` | Lecture du fichier `.env` |
+| `pygments` | Coloration syntaxique des blocs de code dans les réponses |
+| `psutil` | Mesure de la RAM utilisée par l'application (affichage des stats) |
 
-**Modèle** : le fichier `.gguf` du modèle (`ornith-1.0-9b-Q4_K_M.gguf`, ~5,6 Go) n'est pas installé par
-ce projet — il est référencé via le chemin `MODEL_PATH` dans `.env`. Dans la configuration actuelle,
-ce fichier a été téléchargé au préalable par [LM Studio](https://lmstudio.ai/) et se trouve sous
-`C:\Users\<toi>\.lmstudio\models\...`. LM Studio lui-même n'est plus nécessaire pour faire tourner
-l'agent (le modèle n'est plus chargé que par notre propre code), mais le fichier `.gguf` doit rester
-présent sur le disque à cet emplacement.
+**Modèle** : le fichier `.gguf` du modèle n'est pas installé par ce projet — il est référencé via un
+chemin choisi dans l'interface (ou `MODEL_PATH` dans `.env` au premier lancement). Le modèle par défaut
+utilisé jusqu'ici (`ornith-1.0-9b-Q4_K_M.gguf`, ~5,6 Go) a été téléchargé au préalable par
+[LM Studio](https://lmstudio.ai/) et se trouve sous `C:\Users\<toi>\.lmstudio\models\...`. LM Studio
+lui-même n'est plus nécessaire pour faire tourner l'agent (le modèle n'est plus chargé que par notre
+propre code), mais le fichier `.gguf` doit rester présent sur le disque à cet emplacement.
 
 ## Installation
 
@@ -37,7 +38,9 @@ venv\Scripts\activate      # Windows
 pip install -r requirements.txt
 ```
 
-Copier `.env.example` vers `.env` et ajuster `MODEL_PATH` vers l'emplacement réel du fichier `.gguf` :
+Copier `.env.example` vers `.env` et ajuster `MODEL_PATH` vers l'emplacement réel d'un fichier `.gguf`
+(ce chemin ne sert que de modèle par défaut au tout premier lancement — d'autres modèles peuvent ensuite
+être ajoutés directement depuis l'interface) :
 
 ```
 MODEL_PATH=C:\chemin\vers\ton-modele.gguf
@@ -57,18 +60,19 @@ venv\Scripts\activate      # si pas déjà fait dans le terminal courant
 python main.py
 ```
 
-Le chargement du modèle prend quelques secondes (spinner affiché). Le modèle utilisé (`ornith-1.0-9b`)
-sépare sa réflexion (balises `<think>...</think>`) de sa réponse finale ; la réflexion s'affiche en
-italique grisée pendant le streaming, la réponse finale en clair. Seule la réponse finale est conservée
-dans l'historique de conversation.
+Une fenêtre s'ouvre avec :
+- une **combo liste de modèles** en haut, avec un bouton "Parcourir..." pour choisir un autre fichier `.gguf` via l'explorateur Windows (le modèle sélectionné est mémorisé pour les prochains lancements, dans `known_models.json`), et à droite un **indicateur de stats** (vitesse de génération en tokens/s, RAM utilisée par l'application, VRAM utilisée sur le GPU) ;
+- un **panneau latéral gauche** listant les conversations précédentes (par date de création, ou un nom personnalisé si renommée), avec un bouton "Nouvelle conversation" ; clic droit sur une conversation pour la renommer ou la supprimer ;
+- une **zone principale** affichant les échanges, avec rendu Markdown léger (gras, italique, titres, listes) et coloration syntaxique par langage dans les blocs de code ; la réflexion du modèle (balises `<think>...</think>`) est repliée par défaut sous une ligne `[réflexion ▸]` cliquable pour l'afficher ; clic droit sur un message ou un bloc de code pour le copier ;
+- une **zone de saisie** en bas (Entrée pour envoyer, Maj+Entrée pour un saut de ligne).
 
-Commandes disponibles :
-- `/reset` — réinitialise le contexte de conversation
-- `/resume` — liste les sessions enregistrées
-- `/resume <id>` — restaure une session précédente
-- `/exit` ou `Ctrl+D` — quitte le programme
+Le chargement (ou changement) de modèle prend quelques secondes ; l'interface reste réactive pendant la
+génération d'une réponse, à l'exception de la saisie et de la combo modèle qui sont désactivées jusqu'à
+la fin de la réponse en cours. Le bouton "Envoyer" devient un bouton "Arrêter" pendant la génération,
+pour interrompre une réponse en cours (la réponse partielle est conservée). Seule la réponse finale
+(sans la réflexion) est conservée dans l'historique de conversation.
 
-L'historique de chaque session est sauvegardé automatiquement dans `sessions/`.
+L'historique de chaque conversation est sauvegardé automatiquement dans `sessions/`.
 
 ## Désinstallation
 
@@ -82,10 +86,12 @@ Puis supprimer :
 - le dossier `venv/` (contient toutes les dépendances Python listées ci-dessus — rien n'a été installé hors de ce dossier)
 - le dossier `sessions/` (historiques de conversation sauvegardés), si tu veux aussi effacer ton historique
 - le fichier `.env` (contient ta configuration locale, notamment `MODEL_PATH`)
+- le fichier `known_models.json` (liste des modèles ajoutés via "Parcourir...", propre à ta machine)
+- le fichier `session_titles.json` (noms personnalisés donnés aux conversations)
 
-Le fichier `.gguf` du modèle n'est pas géré par ce projet (il appartient à LM Studio) : pour le supprimer,
-il faut le retirer directement depuis l'interface de LM Studio ou supprimer le fichier indiqué par
-`MODEL_PATH` sur le disque.
+Les fichiers `.gguf` des modèles ne sont pas gérés par ce projet : pour les supprimer, il faut les
+retirer directement depuis l'endroit où ils ont été téléchargés (ex: l'interface de LM Studio) ou
+supprimer les fichiers correspondants sur le disque.
 
-Le reste du dossier du projet (`main.py`, `config.py`, etc.) peut ensuite être supprimé normalement,
-comme n'importe quel dossier.
+Le reste du dossier du projet (`main.py`, `gui.py`, `config.py`, etc.) peut ensuite être supprimé
+normalement, comme n'importe quel dossier.

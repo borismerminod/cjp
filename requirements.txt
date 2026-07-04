@@ -2,6 +2,6 @@
 llama-cpp-python
 nvidia-cuda-runtime-cu12
 nvidia-cublas-cu12
-rich
-prompt_toolkit
 python-dotenv
+pygments
+psutil

@@ -64,3 +64,6 @@ class LLMClient:
         response = self.llm.create_chat_completion(messages=messages, stream=False, max_tokens=self.max_tokens)
         content = response["choices"][0]["message"]["content"] or ""
         return THINK_BLOCK_RE.sub("", content).strip()
+
+    def close(self) -> None:
+        self.llm.close()

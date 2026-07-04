@@ -1,6 +1,9 @@
 # Secrets / config locale
 .env
 
+# Liste des modèles connus (chemins spécifiques à la machine)
+known_models.json
+
 # Environnement virtuel Python
 venv/
 .venv/
@@ -17,6 +20,7 @@ __pycache__/
 
 # Historique de conversation (données locales/personnelles)
 sessions/
+session_titles.json
 
 # Éditeurs / IDE
 .vscode/
